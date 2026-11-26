@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.VideoDownloader" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowBackground">@color/aurora_splash_background</item>
+        <item name="android:statusBarColor">@color/aurora_status_bar</item>
+        <item name="android:navigationBarColor">@color/aurora_navigation_bar</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">@color/aurora_accent</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>
