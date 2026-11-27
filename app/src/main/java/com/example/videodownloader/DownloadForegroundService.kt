@@ -261,6 +261,7 @@ class DownloadForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        DownloadStorageMaintenance.runOnce(applicationContext)
         queueRepository = DownloadQueueRepository.getInstance(applicationContext)
         createNotificationChannel()
         registerNetworkMonitor()

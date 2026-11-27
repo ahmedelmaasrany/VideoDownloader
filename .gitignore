@@ -39,3 +39,7 @@ local.properties
 *.before-*
 *.bak
 *.old
+
+# Local patch backups; keep them out of Git releases.
+**/*.backup_*
+/mainactivity_compile_diagnostics.txt

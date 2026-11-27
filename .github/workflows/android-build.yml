@@ -1,4 +1,3 @@
-
 name: Android Build
 
 on:
@@ -13,9 +12,9 @@ permissions:
 
 jobs:
   build:
-    name: Build Android App
+    name: Build Android Variants
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
 
     steps:
       - name: Checkout repository
@@ -33,19 +32,36 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK
-        run: sdkmanager "platforms;android-37.1"
+
+      - name: Install Android SDK, NDK and CMake
+        run: |
+          sdkmanager \
+            "platforms;android-37.1" \
+            "ndk;27.3.13750724" \
+            "cmake;3.22.1"
 
       - name: Make Gradle wrapper executable
         run: chmod +x gradlew
 
-      - name: Build Debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon
+      - name: Build Development Debug and Production Release
+        run: |
+          ./gradlew \
+            :app:assembleDevelopmentDebug \
+            :app:assembleProductionRelease \
+            --no-daemon
 
-      - name: Upload Debug APK
+      - name: Upload Development Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: VideoDownloader-Debug-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: VideoDownloader-v1.1.0-Development-Debug
+          path: app/build/outputs/apk/development/debug/app-development-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Production ARM64 APK (Unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: VideoDownloader-v1.1.0-Production-ARM64-Unsigned
+          path: app/build/outputs/apk/production/release/app-production-release-unsigned.apk
           if-no-files-found: error
           retention-days: 14

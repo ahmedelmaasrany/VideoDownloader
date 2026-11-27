@@ -337,6 +337,20 @@ interface DownloadQueueDao {
 
     @Query(
         """
+        DELETE FROM download_queue
+        WHERE status IN ('SUCCEEDED', 'FAILED')
+          AND id NOT IN (
+              SELECT id FROM download_queue
+              WHERE status IN ('SUCCEEDED', 'FAILED')
+              ORDER BY updatedAt DESC, createdAt DESC
+              LIMIT :keepNewest
+          )
+        """
+    )
+    suspend fun pruneTerminalHistory(keepNewest: Int): Int
+
+    @Query(
+        """
         SELECT COUNT(*) FROM download_queue
         WHERE status IN ('QUEUED', 'RUNNING', 'WAITING_FOR_NETWORK')
         """

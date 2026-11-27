@@ -136,6 +136,7 @@ import kotlin.math.roundToLong
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CancellationException
+import androidx.core.content.edit
 
 private const val TAG = "VideoDownloader"
 
@@ -183,7 +184,12 @@ internal data class VideoFormat(
     val qualityTier: QualityTier,
     val videoCodec: String?,
     val audioCodec: String?,
-    val protocol: String?
+    val protocol: String?,
+    val videoDownloadSizeBytes: Long? = null,
+    val audioDownloadSizeBytes: Long? = null,
+    val videoBitrateKbps: Double? = null,
+    val plannedAudioFormatId: String? = null,
+    val estimatedTotalMs: Long? = null
 ) {
     val isAvailable: Boolean
         get() = formatId.isNotBlank()
@@ -198,7 +204,8 @@ internal data class AudioFormat(
     val sizeIsEstimate: Boolean = true,
     val language: String? = null,
     val formatNote: String? = null,
-    val languagePreference: Int? = null
+    val languagePreference: Int? = null,
+    val protocol: String? = null
 )
 
 internal data class VideoInfo(
@@ -225,24 +232,41 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        DownloadStorageMaintenance.runOnce(applicationContext)
+
+        val welcomePreferences = getSharedPreferences(
+            "video_downloader_preferences",
+            MODE_PRIVATE
+        )
+        val welcomeCompletedAtStartup =
+            welcomePreferences.getBoolean("welcome_completed", false)
+
+        // Returning users skip onboarding. Initialization is process-scoped,
+        // so a configuration change cannot start a second initialization.
+        if (welcomeCompletedAtStartup) {
+            DownloadEngineState.initialize(applicationContext)
+        }
 
         setContent {
             VideoDownloaderTheme {
-                var showWelcome by remember { mutableStateOf(true) }
-                var isInitializing by remember { mutableStateOf(false) }
-                var engineReady by remember { mutableStateOf(false) }
+                var showWelcome by remember {
+                    mutableStateOf(!welcomeCompletedAtStartup)
+                }
+
+                // These observable values live outside the Activity and survive
+                // screen rotation while the Activity is recreated.
+                val isInitializing = DownloadEngineState.isInitializing
+                val engineReady = DownloadEngineState.engineReady
 
                 if (showWelcome) {
                     WelcomeIntroScreen(
                         isLaunching = isInitializing,
                         onStart = {
-                            if (!isInitializing) {
-                                isInitializing = true
-                                initializeDownloadEngine { ready ->
-                                    engineReady = ready
-                                    showWelcome = false
-                                }
+                            welcomePreferences.edit {
+                                putBoolean("welcome_completed", true)
                             }
+                            showWelcome = false
+                            DownloadEngineState.initialize(applicationContext)
                         }
                     )
                 } else {
@@ -254,11 +278,28 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+}
 
-    private fun initializeDownloadEngine(onComplete: (Boolean) -> Unit) {
+/** Process-wide state prevents duplicate yt-dlp initialization on Activity recreation. */
+private object DownloadEngineState {
+
+    var engineReady by mutableStateOf(false)
+        private set
+
+    var isInitializing by mutableStateOf(false)
+        private set
+
+    private val lock = Any()
+
+    fun initialize(context: Context) {
+        synchronized(lock) {
+            if (engineReady || isInitializing) return
+            isInitializing = true
+        }
+
         Thread({
-            val engineReady = try {
-                YtDlp.init(applicationContext)
+            val ready = try {
+                YtDlp.init(context.applicationContext)
                 Log.i(TAG, "yt-dlp initialized")
                 true
             } catch (error: YtDlpException) {
@@ -266,7 +307,7 @@ class MainActivity : ComponentActivity() {
                 false
             }
 
-            if (engineReady) {
+            if (ready) {
                 try {
                     val embeddedVersion = Python.getInstance()
                         .getModule("yt_dlp.version")["__version__"]
@@ -297,7 +338,10 @@ class MainActivity : ComponentActivity() {
             ).start()
 
             Handler(Looper.getMainLooper()).post {
-                if (!isDestroyed) onComplete(engineReady)
+                synchronized(lock) {
+                    engineReady = ready
+                    isInitializing = false
+                }
             }
         }, "VideoDownloaderEngineInit").start()
     }
@@ -668,23 +712,102 @@ private fun pyBoolean(obj: PyObject): Boolean {
     val value = obj.callAttr("get", "has_drm") ?: return false
     return value.toString().equals("True", ignoreCase = true)
 }
+private fun isYouTubeUrl(url: String): Boolean {
+    val host = url.toUri()
+        .host
+        ?.lowercase(Locale.ROOT)
+        .orEmpty()
 
-internal fun extractVideoInfo(url: String): VideoInfo {
+    return host == "youtube.com" ||
+            host.endsWith(".youtube.com") ||
+            host == "youtu.be"
+}
+
+private fun quickJsExecutablePath(context: Context): String {
+    val executable = File(
+        context.applicationInfo.nativeLibraryDir,
+        "libqjs.so"
+    )
+
+    if (!executable.isFile || !executable.canExecute()) {
+        throw IOException(
+            "QuickJS is missing or not executable: ${executable.absolutePath}"
+        )
+    }
+
+    return executable.absolutePath
+}
+
+private fun createQuickJsRuntimeOptions(
+    python: Python,
+    context: Context
+): PyObject {
+    val runtimeOptions = python.builtins.callAttr("dict")
+
+    runtimeOptions.asMap()[PyObject.fromJava("path")] =
+        PyObject.fromJava(quickJsExecutablePath(context))
+
+    val runtimes = python.builtins.callAttr("dict")
+
+    runtimes.asMap()[PyObject.fromJava("quickjs")] =
+        runtimeOptions
+
+    return runtimes
+}
+
+private fun createYouTubeExtractorArgs(python: Python): PyObject {
+    val playerClients = python.builtins.callAttr("list")
+    playerClients.callAttr("append", PyObject.fromJava("default"))
+    playerClients.callAttr("append", PyObject.fromJava("-visionos"))
+
+    val youtubeArgs = python.builtins.callAttr("dict")
+    youtubeArgs.asMap()[PyObject.fromJava("player_client")] = playerClients
+
+    val extractorArgs = python.builtins.callAttr("dict")
+    extractorArgs.asMap()[PyObject.fromJava("youtube")] = youtubeArgs
+
+    return extractorArgs
+}
+
+internal fun extractVideoInfo(url: String, context: Context): VideoInfo {
 
     val python = Python.getInstance()
     val ytDlpModule = python.getModule("yt_dlp")
     val options = python.builtins.callAttr("dict")
     val optionsMap = options.asMap()
 
-    optionsMap[PyObject.fromJava("quiet")] = PyObject.fromJava(true)
-    optionsMap[PyObject.fromJava("no_warnings")] = PyObject.fromJava(true)
+
+    optionsMap[PyObject.fromJava("quiet")] = PyObject.fromJava(false)
+    optionsMap[PyObject.fromJava("no_warnings")] = PyObject.fromJava(false)
+    optionsMap[PyObject.fromJava("verbose")] = PyObject.fromJava(true)
     optionsMap[PyObject.fromJava("skip_download")] = PyObject.fromJava(true)
     optionsMap[PyObject.fromJava("noplaylist")] = PyObject.fromJava(true)
+    if (isYouTubeUrl(url)) {
+        optionsMap[PyObject.fromJava("js_runtimes")] =
+            createQuickJsRuntimeOptions(python, context)
+
+        optionsMap[PyObject.fromJava("extractor_args")] =
+            createYouTubeExtractorArgs(python)
+    }
+
 
     val downloader = ytDlpModule.callAttr("YoutubeDL", options)
 
     try {
         val info = downloader.callAttr("extract_info", url, false)
+
+        if (isYouTubeUrl(url)) {
+            try {
+                val stored = python.getModule("ytdlp_runner")
+                    .callAttr("cache_info", url, info)
+                Log.i(TAG, "YTDLP_INFO_CACHE_STORE=$stored")
+            } catch (error: Exception) {
+                Log.w(
+                    TAG,
+                    "YTDLP_INFO_CACHE_STORE_FAILED: ${errorDetails(error)}"
+                )
+            }
+        }
 
         val title = pyString(info, "title") ?: "Video"
         val duration = pyDouble(info, "duration")
@@ -756,7 +879,8 @@ internal fun extractVideoInfo(url: String): VideoInfo {
                 sizeIsEstimate = size.isApproximate,
                 language = pyString(item, "language"),
                 formatNote = pyString(item, "format_note"),
-                languagePreference = pyInt(item, "language_preference")
+                languagePreference = pyInt(item, "language_preference"),
+                protocol = pyString(item, "protocol")
             )
 
         }.distinctBy { it.formatId }
@@ -943,10 +1067,30 @@ internal fun extractVideoInfo(url: String): VideoInfo {
                 qualityTier = tier,
                 videoCodec = videoCodec,
                 audioCodec = audioCodec,
-                protocol = pyString(item, "protocol")
+                protocol = pyString(item, "protocol"),
+                videoDownloadSizeBytes = resolvedVideoSize,
+                audioDownloadSizeBytes = resolvedAudioSize,
+                videoBitrateKbps = pyDouble(item, "vbr") ?: pyDouble(item, "tbr")
             )
 
         }.distinctBy { it.formatId }
+
+        videoCandidates.forEach { candidate ->
+            Log.i(
+                TAG,
+                "VIDEO_CANDIDATE " +
+                        "id=${candidate.formatId} " +
+                        "height=${candidate.height} " +
+                        "tier=${candidate.qualityTier.label} " +
+                        "codec=${candidate.videoCodec} " +
+                        "ext=${candidate.extension} " +
+                        "sizeBytes=${candidate.fileSize} " +
+                        "estimated=${candidate.sizeIsEstimate} " +
+                        "hasAudio=${candidate.hasAudio} " +
+                        "fps=${candidate.fps} " +
+                        "protocol=${candidate.protocol}"
+            )
+        }
 
         // ثالثًا: نختار الدِّقة الأقرب للمستوى المطلوب،
         // ثم نختار أقل حجم بين الصيغ التي تقدم الدِّقَّة نفسها.
@@ -959,48 +1103,79 @@ internal fun extractVideoInfo(url: String): VideoInfo {
             if (candidates.isEmpty()) return null
 
             val preferredHeight = when (tier) {
+                QualityTier.WEAK -> candidates.maxOfOrNull { it.height }
+                QualityTier.MEDIUM -> candidates.map { it.height }
+                    .distinct()
+                    .minWithOrNull(compareBy<Int> { kotlin.math.abs(it - 360) }.thenByDescending { it })
+                QualityTier.STRONG -> candidates.map { it.height }
+                    .distinct()
+                    .minWithOrNull(compareBy<Int> { kotlin.math.abs(it - 720) }.thenByDescending { it })
+                QualityTier.ULTRA -> candidates.minOfOrNull { it.height }
+            } ?: return null
 
-                QualityTier.WEAK ->
-                    candidates.maxOfOrNull { it.height }
+            val matchingCandidates = candidates.filter { it.height == preferredHeight }
 
-                QualityTier.MEDIUM ->
-                    candidates.map { it.height }
-                        .distinct()
-                        .minWithOrNull(
-                            compareBy<Int> {
-                                kotlin.math.abs(it - 360)
-                            }.thenByDescending { it }
-                        )
-
-                QualityTier.STRONG ->
-                    candidates.map { it.height }
-                        .distinct()
-                        .minWithOrNull(
-                            compareBy<Int> {
-                                kotlin.math.abs(it - 720)
-                            }.thenByDescending { it }
-                        )
-
-                QualityTier.ULTRA ->
-                    candidates.minOfOrNull { it.height }
+            // Keep the best original/language track preference. Within that track,
+            // compare codec, transfer size, conversion and save costs together.
+            val bestTrackRank = audioFormats.minOfOrNull { audioTrackRank(it) }
+            val bestTrack = audioFormats.filter { bestTrackRank == null || audioTrackRank(it) == bestTrackRank }
+            val bestLanguagePreference = bestTrack.mapNotNull { it.languagePreference }.maxOrNull()
+            val routeAudioCandidates = if (bestLanguagePreference != null) {
+                bestTrack.filter { it.languagePreference == bestLanguagePreference }
+            } else {
+                bestTrack
             }
 
-            return candidates
-                .filter { it.height == preferredHeight }
-                .minWithOrNull(
-                    compareBy<VideoFormat> {
-                        videoCodecPreference(it.videoCodec)
-                    }.thenBy {
-                        containerPreference(it.extension)
-                    }.thenBy {
-                        it.fileSize ?: Long.MAX_VALUE
-                    }.thenBy {
-                        protocolPreference(it.protocol)
-                    }
-                )
+            data class RouteChoice(
+                val video: VideoFormat,
+                val audio: AudioFormat?,
+                val estimate: DownloadRoutePlanner.RouteEstimate
+            )
+
+            val choices = mutableListOf<RouteChoice>()
+
+            matchingCandidates.forEach { candidate ->
+                val audioChoices: List<AudioFormat?> = when {
+                    candidate.hasAudio -> listOf(null)
+                    routeAudioCandidates.isNotEmpty() -> routeAudioCandidates.map { it }
+                    else -> listOf(null) // yt-dlp bestaudio fallback
+                }
+
+                audioChoices.forEach { audio ->
+                    val estimate = DownloadRoutePlanner.estimate(
+                        context = context,
+                        sourceUrl = url,
+                        video = candidate,
+                        audio = audio,
+                        durationSeconds = duration
+                    )
+                    choices += RouteChoice(candidate, audio, estimate)
+                }
+            }
+
+            val best = choices.minWithOrNull(
+                compareBy<RouteChoice> { it.estimate.totalMs }
+                    .thenBy { videoCodecPreference(it.video.videoCodec) }
+                    .thenBy { containerPreference(it.video.extension) }
+                    .thenBy { it.estimate.totalDownloadBytes }
+                    .thenBy { protocolPreference(it.video.protocol) }
+            ) ?: return null
+
+            val chosenAudioId = when {
+                best.video.hasAudio -> null
+                best.audio != null -> best.audio.formatId
+                else -> "bestaudio"
+            }
+
+            return best.video.copy(
+                fileSize = best.estimate.totalDownloadBytes,
+                sizeIsEstimate = best.video.sizeIsEstimate || best.estimate.sizeIsApproximate,
+                audioDownloadSizeBytes = best.estimate.audioDownloadBytes,
+                plannedAudioFormatId = chosenAudioId,
+                estimatedTotalMs = best.estimate.totalMs
+            )
         }
 
-        // رابعًا: إرجاع أربع خيارات ثابتة فقط.
         val qualityOptions = QualityTier.entries.map { tier ->
 
             chooseFormat(tier) ?: VideoFormat(
@@ -1028,7 +1203,9 @@ internal fun extractVideoInfo(url: String): VideoInfo {
                         "formatId=${option.formatId}, " +
                         "extension=${option.extension}, " +
                         "estimatedSize=${option.fileSize}, " +
-                        "sizeIsEstimate=${option.sizeIsEstimate}"
+                        "sizeIsEstimate=${option.sizeIsEstimate}, " +
+                        "plannedAudio=${option.plannedAudioFormatId}, " +
+                        "estimatedTotalMs=${option.estimatedTotalMs}"
             )
         }
         return VideoInfo(
@@ -1065,6 +1242,7 @@ internal fun errorDetails(error: Throwable): String {
 }
 
 private fun downloadOneFormat(
+    context: Context,
     url: String,
     directory: File,
     filePrefix: String,
@@ -1081,7 +1259,16 @@ private fun downloadOneFormat(
         .addOption("--retry-sleep", "http:exp=1:20")
         .addOption("--retry-sleep", "fragment:exp=1:20")
         .addOption("--abort-on-unavailable-fragments")
-
+    if (isYouTubeUrl(url)) {
+        request.addOption(
+            "--js-runtimes",
+            "quickjs:${quickJsExecutablePath(context)}"
+        )
+        request.addOption(
+            "--extractor-args",
+            "youtube:player_client=default,-visionos"
+        )
+    }
     val diagnosticLines = Collections.synchronizedList(mutableListOf<String>())
 
     val logger = LogCallback { level, message ->
@@ -1604,7 +1791,9 @@ private fun checkYtDlpOptionMapping() {
             "--retries",
             "--fragment-retries",
             "--retry-sleep",
-            "--abort-on-unavailable-fragments"
+            "--abort-on-unavailable-fragments",
+            "--js-runtimes",
+            "--extractor-args"
         )
 
         flags.forEach { flag ->
@@ -2126,6 +2315,8 @@ internal fun downloadSelectedVideo(
                 "acodec=${selectedFormat.audioCodec} " +
                 "protocol=${selectedFormat.protocol} " +
                 "hasAudio=${selectedFormat.hasAudio} " +
+                "plannedAudio=${selectedFormat.plannedAudioFormatId} " +
+                "estimatedTotalMs=${selectedFormat.estimatedTotalMs} " +
                 "estimatedSizeMiB=${selectedFormat.fileSize?.div(1048576L)} " +
                 "sizeIsEstimate=${selectedFormat.sizeIsEstimate}"
     )
@@ -2139,13 +2330,16 @@ internal fun downloadSelectedVideo(
         "video-download-${System.currentTimeMillis()}"
     )
 
-    if (!workDir.mkdirs() && !workDir.isDirectory) {
+    if (!DownloadWorkspaceRegistry.createAndRegister(workDir)) {
         throw IOException("تعذر إنشاء مجلد العمل.")
     }
 
     // إذا استمر FFmpeg بعد طلب الإلغاء، نؤجل حذف الملفات
     // حتى يصل Callback انتهاء العملية.
     val cleanupAfterFfmpeg = AtomicBoolean(false)
+
+    var videoDownloadAttempted = false
+    var videoDownloadSucceeded = false
 
     try {
 
@@ -2184,8 +2378,10 @@ internal fun downloadSelectedVideo(
 
         val videoStartedAt = SystemClock.elapsedRealtime()
         var videoFirstProgressAt = 0L
+        videoDownloadAttempted = true
 
         val videoFile = downloadOneFormat(
+            context = context,
             url = url,
             directory = workDir,
             filePrefix = videoPrefix,
@@ -2202,12 +2398,21 @@ internal fun downloadSelectedVideo(
             )
         }
 
+        videoDownloadSucceeded = true
         report.transfer(
             "VIDEO_DOWNLOAD",
             videoStartedAt,
             videoFirstProgressAt,
             videoFile.length(),
             "format=${selectedFormat.formatId}"
+        )
+        DownloadRoutePlanner.recordTransferSample(
+            context = context,
+            sourceUrl = url,
+            protocol = selectedFormat.protocol,
+            bytes = videoFile.length(),
+            totalElapsedMs = SystemClock.elapsedRealtime() - videoStartedAt,
+            startupElapsedMs = if (videoFirstProgressAt > 0L) videoFirstProgressAt - videoStartedAt else null
         )
 
         // -------------------------------------------------
@@ -2256,17 +2461,26 @@ internal fun downloadSelectedVideo(
             // 3. تنزيل الصوت عند عدم وجوده داخل المِلف
             // -------------------------------------------------
 
+            val bestAudioFallback = AudioFormat(
+                formatId = "bestaudio",
+                bitrate = 0.0,
+                extension = "auto",
+                fileSize = null
+            )
+            val plannedAudio = when (selectedFormat.plannedAudioFormatId) {
+                "bestaudio" -> bestAudioFallback
+                null -> null
+                else -> audioFormats.firstOrNull { it.formatId == selectedFormat.plannedAudioFormatId }
+            }
+            val rankedAudioCandidates = audioFormats
+                .filter { audioTrackRank(it) < 2 }
+                .ifEmpty { audioFormats }
             val candidates = (
-                    audioFormats
-                        .filter { audioTrackRank(it) < 2 }
-                        .ifEmpty { audioFormats }
-                        .take(3) +
-                            AudioFormat(
-                                formatId = "bestaudio",
-                                bitrate = 0.0,
-                                extension = "auto",
-                                fileSize = null
-                            )
+                    listOfNotNull(plannedAudio) +
+                            rankedAudioCandidates
+                                .filterNot { it.formatId == plannedAudio?.formatId }
+                                .take(if (plannedAudio == null) 3 else 2) +
+                            bestAudioFallback
                     ).distinctBy { it.formatId }
 
             report.info(
@@ -2307,10 +2521,12 @@ internal fun downloadSelectedVideo(
 
                 val audioStartedAt = SystemClock.elapsedRealtime()
                 var audioFirstProgressAt = 0L
+                var candidateDownloadCompleted = false
 
                 try {
 
                     val candidateFile = downloadOneFormat(
+                        context = context,
                         url = url,
                         directory = workDir,
                         filePrefix = attemptPrefix,
@@ -2340,6 +2556,7 @@ internal fun downloadSelectedVideo(
                         )
                     }
 
+                    candidateDownloadCompleted = true
                     report.transfer(
                         "AUDIO_DOWNLOAD",
                         audioStartedAt,
@@ -2348,6 +2565,14 @@ internal fun downloadSelectedVideo(
                         "format=${candidate.formatId} " +
                                 "language=${candidate.language} " +
                                 "note=${candidate.formatNote}"
+                    )
+                    DownloadRoutePlanner.recordTransferSample(
+                        context = context,
+                        sourceUrl = url,
+                        protocol = candidate.protocol ?: selectedFormat.protocol,
+                        bytes = candidateFile.length(),
+                        totalElapsedMs = SystemClock.elapsedRealtime() - audioStartedAt,
+                        startupElapsedMs = if (audioFirstProgressAt > 0L) audioFirstProgressAt - audioStartedAt else null
                     )
 
                     val candidateProbeStartedAt = SystemClock.elapsedRealtime()
@@ -2406,6 +2631,13 @@ internal fun downloadSelectedVideo(
                         "format=${candidate.formatId} error=${detail.take(300)}"
                     )
 
+                    if (!candidateDownloadCompleted) {
+                        DownloadRoutePlanner.recordAttemptFailure(
+                            context = context,
+                            sourceUrl = url,
+                            protocol = candidate.protocol ?: selectedFormat.protocol
+                        )
+                    }
                     audioErrors.add(
                         "${candidate.formatId}: $detail"
                     )
@@ -2639,12 +2871,15 @@ internal fun downloadSelectedVideo(
                     // إلا بعد انتهاء مهلة الانتظار، ننظف المجلد هنا.
                     if (cleanupAfterFfmpeg.get()) {
 
-                        val deleted = workDir.deleteRecursively()
-
-                        Log.i(
-                            TAG,
-                            "FFMPEG_TEMP_CLEANUP_AFTER_CANCEL=$deleted"
-                        )
+                        try {
+                            val deleted = workDir.deleteRecursively()
+                            Log.i(
+                                TAG,
+                                "FFMPEG_TEMP_CLEANUP_AFTER_CANCEL=$deleted"
+                            )
+                        } finally {
+                            DownloadWorkspaceRegistry.unregister(workDir)
+                        }
                     }
                 },
 
@@ -2719,7 +2954,11 @@ internal fun downloadSelectedVideo(
                     cleanupAfterFfmpeg.set(true)
 
                     if (mergeFinished.count == 0L) {
-                        workDir.deleteRecursively()
+                        try {
+                            workDir.deleteRecursively()
+                        } finally {
+                            DownloadWorkspaceRegistry.unregister(workDir)
+                        }
                     }
                 }
 
@@ -2751,7 +2990,11 @@ internal fun downloadSelectedVideo(
                 cleanupAfterFfmpeg.set(true)
 
                 if (mergeFinished.count == 0L) {
-                    workDir.deleteRecursively()
+                    try {
+                        workDir.deleteRecursively()
+                    } finally {
+                        DownloadWorkspaceRegistry.unregister(workDir)
+                    }
                 }
             }
 
@@ -2775,6 +3018,15 @@ internal fun downloadSelectedVideo(
             totalVideoFrames,
             mergedFile.length()
         )
+        if (!copyVideo) {
+            DownloadRoutePlanner.recordVideoEncodeSample(
+                context = context,
+                sourceCodec = videoProbe.videoCodec,
+                height = videoProbe.videoHeight,
+                durationSeconds = videoProbe.durationSeconds,
+                elapsedMs = SystemClock.elapsedRealtime() - ffmpegStartedAt
+            )
+        }
 
         val ffmpegSession = completedFfmpegSession
             ?: throw IOException(
@@ -2923,6 +3175,11 @@ internal fun downloadSelectedVideo(
             0L,
             mergedFile.length()
         )
+        DownloadRoutePlanner.recordSaveSample(
+            context = context,
+            bytes = mergedFile.length(),
+            elapsedMs = SystemClock.elapsedRealtime() - saveStartedAt
+        )
 
         onProgress(
             100f,
@@ -2933,6 +3190,13 @@ internal fun downloadSelectedVideo(
 
     } catch (error: Throwable) {
 
+        if (videoDownloadAttempted && !videoDownloadSucceeded && !Thread.currentThread().isInterrupted) {
+            DownloadRoutePlanner.recordAttemptFailure(
+                context = context,
+                sourceUrl = url,
+                protocol = selectedFormat.protocol
+            )
+        }
         report.fail(error)
 
         throw error
@@ -2942,7 +3206,11 @@ internal fun downloadSelectedVideo(
         // لا تحذف الملفات إذا كان FFmpeg لا يزال يعمل بعد الإلغاء.
         // Callback الخاص به سيتولى التنظيف عند انتهاء العملية.
         if (!cleanupAfterFfmpeg.get()) {
-            workDir.deleteRecursively()
+            try {
+                workDir.deleteRecursively()
+            } finally {
+                DownloadWorkspaceRegistry.unregister(workDir)
+            }
         }
 
         report.finish(context)
@@ -3509,7 +3777,7 @@ fun DownloaderScreen(engineReady: Boolean, context: Context) {
 
                                                 AnalysisStateStore.executor.execute {
                                                     try {
-                                                        val result = extractVideoInfo(input)
+                                                        val result = extractVideoInfo(input, context)
                                                         mainHandler.post {
                                                             AnalysisStateStore.isAnalyzing = false
                                                             AnalysisStateStore.videoTitle = result.title

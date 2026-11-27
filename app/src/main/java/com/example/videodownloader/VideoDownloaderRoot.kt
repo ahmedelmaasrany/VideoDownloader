@@ -411,7 +411,7 @@ private fun MultiDownloadScreen(
 
             AnalysisStateStore.executor.execute {
                 try {
-                    val info = extractVideoInfo(entry.url)
+                    val info = extractVideoInfo(entry.url, context)
                     mainHandler.post {
                         val currentIndex = entries.indexOfFirst { it.id == entry.id }
                         if (currentIndex >= 0) {

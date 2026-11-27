@@ -92,6 +92,10 @@ class DownloadQueueRepository private constructor(context: Context) {
 
     suspend fun deleteAllActiveAndReturn(): List<DownloadQueueEntity> =
         dao.deleteAllActiveAndReturn()
+
+    /** Keeps only the newest terminal records; active queue rows are never selected. */
+    suspend fun pruneTerminalHistory(keepNewest: Int = 100): Int =
+        dao.pruneTerminalHistory(keepNewest.coerceAtLeast(0))
     suspend fun updateTaskState(
         taskId: String,
         status: String,
@@ -141,6 +145,11 @@ internal object DownloadQueueFormatCodec {
             put("videoCodec", format.videoCodec ?: JSONObject.NULL)
             put("audioCodec", format.audioCodec ?: JSONObject.NULL)
             put("protocol", format.protocol ?: JSONObject.NULL)
+            put("videoDownloadSizeBytes", format.videoDownloadSizeBytes ?: JSONObject.NULL)
+            put("audioDownloadSizeBytes", format.audioDownloadSizeBytes ?: JSONObject.NULL)
+            put("videoBitrateKbps", format.videoBitrateKbps ?: JSONObject.NULL)
+            put("plannedAudioFormatId", format.plannedAudioFormatId ?: JSONObject.NULL)
+            put("estimatedTotalMs", format.estimatedTotalMs ?: JSONObject.NULL)
         }.toString()
 
     fun decodeVideo(json: String): VideoFormat {
@@ -159,7 +168,12 @@ internal object DownloadQueueFormatCodec {
             ),
             videoCodec = nullableString(item, "videoCodec"),
             audioCodec = nullableString(item, "audioCodec"),
-            protocol = nullableString(item, "protocol")
+            protocol = nullableString(item, "protocol"),
+            videoDownloadSizeBytes = nullableLong(item, "videoDownloadSizeBytes"),
+            audioDownloadSizeBytes = nullableLong(item, "audioDownloadSizeBytes"),
+            videoBitrateKbps = nullableDouble(item, "videoBitrateKbps"),
+            plannedAudioFormatId = nullableString(item, "plannedAudioFormatId"),
+            estimatedTotalMs = nullableLong(item, "estimatedTotalMs")
         )
     }
 
@@ -180,6 +194,7 @@ internal object DownloadQueueFormatCodec {
                             "languagePreference",
                             audio.languagePreference ?: JSONObject.NULL
                         )
+                        put("protocol", audio.protocol ?: JSONObject.NULL)
                     }
                 )
             }
@@ -200,7 +215,8 @@ internal object DownloadQueueFormatCodec {
                 sizeIsEstimate = item.optBoolean("sizeIsEstimate", true),
                 language = nullableString(item, "language"),
                 formatNote = nullableString(item, "formatNote"),
-                languagePreference = nullableInt(item, "languagePreference")
+                languagePreference = nullableInt(item, "languagePreference"),
+                protocol = nullableString(item, "protocol")
             )
         }
     }
