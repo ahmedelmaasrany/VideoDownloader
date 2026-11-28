@@ -3,8 +3,6 @@ package com.example.videodownloader
 import android.content.Context
 import android.net.Uri
 import java.util.Locale
-import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.roundToLong
 
 /**
@@ -21,10 +19,9 @@ internal object DownloadRoutePlanner {
         val totalDownloadBytes: Long,
         val audioDownloadBytes: Long?,
         val sizeIsApproximate: Boolean,
-        val networkMs: Long,
-        val videoEncodeMs: Long,
-        val audioEncodeMs: Long,
-        val muxMs: Long,
+        val videoDownloadMs: Long,
+        val audioDownloadMs: Long,
+        val processingMs: Long,
         val validationMs: Long,
         val saveMs: Long,
         val retryRiskMs: Long
@@ -45,22 +42,36 @@ internal object DownloadRoutePlanner {
         audio: AudioFormat?,
         durationSeconds: Double?
     ): RouteEstimate {
-        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val prefs = context.applicationContext.getSharedPreferences(
+            PREFS_NAME,
+            Context.MODE_PRIVATE
+        )
+
         migrateLegacyNetworkStats(prefs)
+
         val host = normalizedHost(sourceUrl)
         val videoProtocol = protocolClass(video.protocol)
         val audioProtocol = protocolClass(audio?.protocol ?: video.protocol)
 
-        val safeDuration = durationSeconds?.takeIf { it.isFinite() && it > 0.0 }
+        val safeDuration = durationSeconds?.takeIf {
+            it.isFinite() && it > 0.0
+        }
+
         val videoRate = video.videoBitrateKbps
             ?.takeIf { it.isFinite() && it > 0.0 }
             ?: fallbackVideoRate(video.qualityTier)
-        val audioRate = audio?.bitrate?.takeIf { it.isFinite() && it > 0.0 } ?: 128.0
+
+        val audioRate = audio?.bitrate
+            ?.takeIf { it.isFinite() && it > 0.0 }
+            ?: 128.0
 
         val videoBytes = video.videoDownloadSizeBytes
             ?.takeIf { it > 0L }
             ?: video.fileSize?.takeIf { it > 0L }
-            ?: estimateBytes(safeDuration, if (video.hasAudio) videoRate + audioRate else videoRate)
+            ?: estimateBytes(
+                safeDuration,
+                if (video.hasAudio) videoRate + audioRate else videoRate
+            )
 
         val audioBytes = if (video.hasAudio) {
             null
@@ -69,71 +80,136 @@ internal object DownloadRoutePlanner {
                 ?: estimateBytes(safeDuration, audioRate)
         }
 
-        val totalDownloadBytes = safeAdd(videoBytes, audioBytes) ?: videoBytes ?: audioBytes ?: 1L
-        val sizeIsApproximate = video.videoDownloadSizeBytes == null ||
-            (!video.hasAudio && (audio?.fileSize == null || audio.sizeIsEstimate)) ||
-            video.sizeIsEstimate
+        val totalDownloadBytes =
+            safeAdd(videoBytes, audioBytes)
+                ?: videoBytes
+                ?: audioBytes
+                ?: 1L
 
-        val networkVideoMs = estimateTransferMs(prefs, host, videoProtocol, videoBytes)
-        val networkAudioMs = if (video.hasAudio) 0L else estimateTransferMs(prefs, host, audioProtocol, audioBytes)
-        val networkMs = safeAdd(networkVideoMs, networkAudioMs) ?: Long.MAX_VALUE / 4
+        val sizeIsApproximate =
+            video.videoDownloadSizeBytes == null ||
+                    (!video.hasAudio && (audio?.fileSize == null || audio.sizeIsEstimate)) ||
+                    video.sizeIsEstimate
 
-        // The production pipeline currently uses libopenh264 for non-H.264 video.
-        // The VP9 prior reflects the user's measured ~0.97x real-time result.
+        val videoDownloadMs = estimateTransferMs(
+            prefs,
+            host,
+            videoProtocol,
+            videoBytes
+        )
+
+        val audioDownloadMs = if (video.hasAudio) {
+            0L
+        } else {
+            estimateTransferMs(
+                prefs,
+                host,
+                audioProtocol,
+                audioBytes
+            )
+        }
+
         val videoNeedsEncode = !isLikelyH264(video.videoCodec)
-        val audioCodec = if (video.hasAudio) video.audioCodec else audio?.codec
+
+        val audioCodec = if (video.hasAudio) {
+            video.audioCodec
+        } else {
+            audio?.codec
+        }
+
         val audioNeedsEncode = !isLikelyAacLc(audioCodec)
-
         val mediaSeconds = safeDuration ?: 0.0
-        val encodeSpeed = encodeSpeed(prefs, video.videoCodec, video.height)
-        val videoEncodeMs = if (videoNeedsEncode && mediaSeconds > 0.0) {
-            (mediaSeconds / encodeSpeed * 1000.0).coerceAtMost(Long.MAX_VALUE.toDouble()).roundToLong()
-        } else 0L
-        // AAC encoding is much cheaper than video encoding; this is a conservative
-        // fallback until actual AAC conversion timings are recorded separately.
-        val audioEncodeMs = if (audioNeedsEncode && mediaSeconds > 0.0) {
-            (mediaSeconds * 0.02 * 1000.0).roundToLong()
-        } else 0L
 
-        val muxMs = if (videoNeedsEncode || audioNeedsEncode) 900L else 350L
-        val validationMs = 700L
+        val encoderMode = if (videoNeedsEncode) {
+            "openh264"
+        } else {
+            "aac"
+        }
+
+        val processingMs = estimateProcessingMs(
+            prefs = prefs,
+            videoCodec = video.videoCodec,
+            height = video.height,
+            audioCodec = audioCodec,
+            videoNeedsEncode = videoNeedsEncode,
+            audioNeedsEncode = audioNeedsEncode,
+            durationSeconds = mediaSeconds,
+            encoderMode = encoderMode
+        )
+
+        val validationMs = prefs.getLong(
+            "validation.ms",
+            700L
+        ).coerceIn(200L, 5_000L)
 
         val targetVideoRate = if (videoNeedsEncode) {
             (videoRate * 1.35).coerceIn(350.0, 16_000.0)
-        } else videoRate
-        val expectedOutputBytes = if (videoNeedsEncode || audioNeedsEncode) {
-            estimateBytes(mediaSeconds.takeIf { it > 0.0 }, targetVideoRate + 128.0)
-                ?: totalDownloadBytes
-        } else totalDownloadBytes
+        } else {
+            videoRate
+        }
 
-        val saveSpeed = prefs.getFloat("save.mib_per_sec", DEFAULT_SAVE_MIB_PER_SEC.toFloat())
-            .toDouble().coerceIn(1.0, 500.0)
-        val saveMs = ((expectedOutputBytes / MIB) / saveSpeed * 1000.0)
-            .coerceAtMost(Long.MAX_VALUE.toDouble()).roundToLong()
+        val expectedOutputBytes = if (
+            videoNeedsEncode || audioNeedsEncode
+        ) {
+            estimateBytes(
+                mediaSeconds.takeIf { it > 0.0 },
+                targetVideoRate + 128.0
+            ) ?: totalDownloadBytes
+        } else {
+            totalDownloadBytes
+        }
 
-        val videoRiskMs = expectedRetryCostMs(prefs, host, videoProtocol, networkVideoMs)
-        val audioRiskMs = if (video.hasAudio) 0L else expectedRetryCostMs(prefs, host, audioProtocol, networkAudioMs)
-        val retryRiskMs = safeAdd(videoRiskMs, audioRiskMs) ?: Long.MAX_VALUE / 4
+        val saveSpeed = prefs.getFloat(
+            "save.mib_per_sec",
+            DEFAULT_SAVE_MIB_PER_SEC.toFloat()
+        ).toDouble().coerceIn(1.0, 500.0)
+
+        val saveMs = (
+                (expectedOutputBytes / MIB) / saveSpeed * 1000.0
+                ).coerceAtMost(Long.MAX_VALUE.toDouble()).roundToLong()
+
+        val videoRiskMs = expectedRetryCostMs(
+            prefs,
+            host,
+            videoProtocol,
+            videoDownloadMs
+        )
+
+        val audioRiskMs = if (video.hasAudio) {
+            0L
+        } else {
+            expectedRetryCostMs(
+                prefs,
+                host,
+                audioProtocol,
+                audioDownloadMs
+            )
+        }
+
+        val retryRiskMs = safeAdd(
+            videoRiskMs,
+            audioRiskMs
+        ) ?: Long.MAX_VALUE / 4L
 
         val total = listOf(
-            networkMs,
-            videoEncodeMs,
-            audioEncodeMs,
-            muxMs,
+            videoDownloadMs,
+            audioDownloadMs,
+            processingMs,
             validationMs,
             saveMs,
             retryRiskMs
-        ).fold(0L) { sum, value -> safeAdd(sum, value) ?: Long.MAX_VALUE / 2 }
+        ).fold(0L) { sum, value ->
+            safeAdd(sum, value) ?: Long.MAX_VALUE / 2L
+        }
 
         return RouteEstimate(
             totalMs = total,
             totalDownloadBytes = totalDownloadBytes,
             audioDownloadBytes = audioBytes,
             sizeIsApproximate = sizeIsApproximate,
-            networkMs = networkMs,
-            videoEncodeMs = videoEncodeMs,
-            audioEncodeMs = audioEncodeMs,
-            muxMs = muxMs,
+            videoDownloadMs = videoDownloadMs,
+            audioDownloadMs = audioDownloadMs,
+            processingMs = processingMs,
             validationMs = validationMs,
             saveMs = saveMs,
             retryRiskMs = retryRiskMs
@@ -188,26 +264,6 @@ internal object DownloadRoutePlanner {
         }
     }
 
-    fun recordVideoEncodeSample(
-        context: Context,
-        sourceCodec: String?,
-        height: Int?,
-        durationSeconds: Double?,
-        elapsedMs: Long
-    ) {
-        if (elapsedMs <= 0L || durationSeconds == null || !durationSeconds.isFinite() || durationSeconds <= 0.0) return
-        val measuredSpeed = durationSeconds / (elapsedMs / 1000.0)
-        if (!measuredSpeed.isFinite() || measuredSpeed <= 0.0) return
-        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val key = "encode.${codecClass(sourceCodec)}.${height ?: 0}.realtime_speed"
-        synchronized(lock) {
-            val exists = prefs.contains(key)
-            val old = prefs.getFloat(key, defaultEncodeSpeed(sourceCodec).toFloat()).toDouble()
-            val newValue = if (exists) ewma(old, measuredSpeed) else measuredSpeed
-            prefs.edit().putFloat(key, newValue.toFloat()).apply()
-        }
-    }
-
     fun recordSaveSample(context: Context, bytes: Long, elapsedMs: Long) {
         if (bytes <= 0L || elapsedMs <= 0L) return
         val measured = (bytes / MIB) / (elapsedMs / 1000.0)
@@ -218,6 +274,130 @@ internal object DownloadRoutePlanner {
             val old = prefs.getFloat("save.mib_per_sec", DEFAULT_SAVE_MIB_PER_SEC.toFloat()).toDouble()
             val next = if (exists) ewma(old, measured) else measured
             prefs.edit().putFloat("save.mib_per_sec", next.toFloat()).apply()
+        }
+    }
+
+    private fun processingProfileKey(
+        videoCodec: String?,
+        height: Int?,
+        audioCodec: String?,
+        videoNeedsEncode: Boolean,
+        audioNeedsEncode: Boolean,
+        encoderMode: String
+    ): String {
+        return "processing." +
+                "${codecClass(videoCodec)}." +
+                "${height ?: 0}." +
+                "${codecClass(audioCodec)}." +
+                "${if (videoNeedsEncode) "venc" else "vcopy"}." +
+                "${if (audioNeedsEncode) "aenc" else "acopy"}." +
+                encoderMode
+    }
+
+    private fun estimateProcessingMs(
+        prefs: android.content.SharedPreferences,
+        videoCodec: String?,
+        height: Int?,
+        audioCodec: String?,
+        videoNeedsEncode: Boolean,
+        audioNeedsEncode: Boolean,
+        durationSeconds: Double,
+        encoderMode: String
+    ): Long {
+        if (!videoNeedsEncode && !audioNeedsEncode) {
+            return 350L
+        }
+
+        val key = processingProfileKey(
+            videoCodec,
+            height,
+            audioCodec,
+            videoNeedsEncode,
+            audioNeedsEncode,
+            encoderMode
+        )
+
+        val fallbackSpeed = if (videoNeedsEncode) {
+            defaultEncodeSpeed(videoCodec)
+        } else {
+            18.0
+        }
+
+        val measuredSpeed = prefs.getFloat(
+            "$key.realtime_speed",
+            fallbackSpeed.toFloat()
+        ).toDouble().coerceIn(0.1, 100.0)
+
+        val startupMs = if (videoNeedsEncode) 900L else 400L
+
+        val encodeMs = (
+                durationSeconds / measuredSpeed * 1000.0
+                ).coerceAtMost(Long.MAX_VALUE.toDouble()).roundToLong()
+
+        return safeAdd(startupMs, encodeMs)
+            ?: Long.MAX_VALUE / 4L
+    }
+
+    fun recordProcessingSample(
+        context: Context,
+        sourceVideoCodec: String?,
+        height: Int?,
+        sourceAudioCodec: String?,
+        videoNeedsEncode: Boolean,
+        audioNeedsEncode: Boolean,
+        durationSeconds: Double?,
+        elapsedMs: Long,
+        encoderMode: String
+    ) {
+        if (!videoNeedsEncode && !audioNeedsEncode) return
+        if (
+            elapsedMs <= 0L ||
+            durationSeconds == null ||
+            !durationSeconds.isFinite() ||
+            durationSeconds <= 0.0
+        ) {
+            return
+        }
+
+        val measuredSpeed = durationSeconds / (elapsedMs / 1000.0)
+        if (!measuredSpeed.isFinite() || measuredSpeed <= 0.0) return
+
+        val prefs = context.applicationContext.getSharedPreferences(
+            PREFS_NAME,
+            Context.MODE_PRIVATE
+        )
+
+        val key = processingProfileKey(
+            sourceVideoCodec,
+            height,
+            sourceAudioCodec,
+            videoNeedsEncode,
+            audioNeedsEncode,
+            encoderMode
+        )
+
+        synchronized(lock) {
+            val samples = prefs.getInt("$key.samples", 0)
+            val fallbackSpeed = if (videoNeedsEncode) {
+                defaultEncodeSpeed(sourceVideoCodec)
+            } else {
+                18.0
+            }
+            val oldSpeed = prefs.getFloat(
+                "$key.realtime_speed",
+                fallbackSpeed.toFloat()
+            ).toDouble()
+
+            val nextSpeed = if (samples > 0) {
+                ewma(oldSpeed, measuredSpeed)
+            } else {
+                measuredSpeed
+            }
+
+            prefs.edit()
+                .putFloat("$key.realtime_speed", nextSpeed.toFloat())
+                .putInt("$key.samples", samples + 1)
+                .apply()
         }
     }
 
@@ -244,12 +424,6 @@ internal object DownloadRoutePlanner {
         // Beta prior: 1 failure / 20 observations (5%) until actual route data exists.
         val probability = ((failures + 1.0) / (successes + failures + 20.0)).coerceIn(0.0, 0.35)
         return (networkMs * probability / (1.0 - probability)).coerceAtMost(Long.MAX_VALUE.toDouble()).roundToLong()
-    }
-
-    private fun encodeSpeed(prefs: android.content.SharedPreferences, codec: String?, height: Int): Double {
-        val key = "encode.${codecClass(codec)}.$height.realtime_speed"
-        return prefs.getFloat(key, defaultEncodeSpeed(codec).toFloat())
-            .toDouble().coerceIn(0.1, 5.0)
     }
 
     private fun defaultEncodeSpeed(codec: String?): Double {

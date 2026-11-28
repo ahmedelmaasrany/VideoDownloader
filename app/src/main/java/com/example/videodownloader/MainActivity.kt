@@ -189,7 +189,14 @@ internal data class VideoFormat(
     val audioDownloadSizeBytes: Long? = null,
     val videoBitrateKbps: Double? = null,
     val plannedAudioFormatId: String? = null,
-    val estimatedTotalMs: Long? = null
+    val estimatedTotalMs: Long? = null,
+    val mediaDurationSeconds: Double? = null,
+    val estimatedVideoDownloadMs: Long? = null,
+    val estimatedAudioDownloadMs: Long? = null,
+    val estimatedProcessingMs: Long? = null,
+    val estimatedValidationMs: Long? = null,
+    val estimatedSaveMs: Long? = null,
+    val estimatedRetryRiskMs: Long? = null
 ) {
     val isAvailable: Boolean
         get() = formatId.isNotBlank()
@@ -270,7 +277,7 @@ class MainActivity : ComponentActivity() {
                         }
                     )
                 } else {
-                    DownloaderScreen(
+                    VideoDownloaderRoot(
                         engineReady = engineReady,
                         context = this@MainActivity
                     )
@@ -1172,7 +1179,14 @@ internal fun extractVideoInfo(url: String, context: Context): VideoInfo {
                 sizeIsEstimate = best.video.sizeIsEstimate || best.estimate.sizeIsApproximate,
                 audioDownloadSizeBytes = best.estimate.audioDownloadBytes,
                 plannedAudioFormatId = chosenAudioId,
-                estimatedTotalMs = best.estimate.totalMs
+                estimatedTotalMs = best.estimate.totalMs,
+                mediaDurationSeconds = duration,
+                estimatedVideoDownloadMs = best.estimate.videoDownloadMs,
+                estimatedAudioDownloadMs = best.estimate.audioDownloadMs,
+                estimatedProcessingMs = best.estimate.processingMs,
+                estimatedValidationMs = best.estimate.validationMs,
+                estimatedSaveMs = best.estimate.saveMs,
+                estimatedRetryRiskMs = best.estimate.retryRiskMs
             )
         }
 
@@ -1247,7 +1261,11 @@ private fun downloadOneFormat(
     directory: File,
     filePrefix: String,
     formatSelector: String,
-    onProgress: (Float) -> Unit
+    onProgress: (
+        Float,
+        Long?,
+        DownloadTransferMetrics?
+    ) -> Unit
 ): File {
     val outputTemplate = File(directory, "$filePrefix.%(ext)s").absolutePath
     val request = YtDlpRequest(url)
@@ -1280,11 +1298,35 @@ private fun downloadOneFormat(
     }
 
     val progressCallback = DownloadProgressCallback { progress, eta, line ->
-        val safeProgress = if (progress.isFinite()) progress.coerceIn(0f, 100f) else 0f
-        Log.d(TAG, "yt-dlp progress=$safeProgress eta=$eta $line")
-        onProgress(safeProgress)
-    }
 
+        val safeProgress = if (progress.isFinite()) {
+            progress.coerceIn(0f, 100f)
+        } else {
+            0f
+        }
+
+        val metrics = DownloadTransferMetrics.fromCallback(
+            callbackEtaSeconds = eta,
+            line = line
+        )
+
+        Log.d(
+            TAG,
+            "YTDLP_PROGRESS " +
+                    "progress=$safeProgress " +
+                    "etaMs=${metrics.estimatedRemainingMs()} " +
+                    "speed=${metrics.speedBytesPerSecond} " +
+                    "downloaded=${metrics.downloadedBytes} " +
+                    "total=${metrics.totalBytes ?: metrics.totalBytesEstimate} " +
+                    "fragments=${metrics.fragmentIndex}/${metrics.fragmentCount}"
+        )
+
+        onProgress(
+            safeProgress,
+            metrics.estimatedRemainingMs(),
+            metrics
+        )
+    }
     val future = YtDlp.executeDebug(
         request,
         logger,
@@ -2299,7 +2341,8 @@ internal fun downloadSelectedVideo(
     title: String,
     selectedFormat: VideoFormat,
     audioFormats: List<AudioFormat>,
-    onProgress: (Float, String) -> Unit
+    progressEstimator: DownloadProgressEstimator,
+    onProgress: (Float, String, Long?) -> Unit
 ): Uri {
 
     val report = DownloadReport(
@@ -2340,7 +2383,35 @@ internal fun downloadSelectedVideo(
 
     var videoDownloadAttempted = false
     var videoDownloadSucceeded = false
+    fun reportProgress(
+        stage: DownloadStage,
+        stagePercent: Float,
+        message: String,
+        etaMs: Long? = null,
+        metrics: DownloadTransferMetrics? = null
+    ) {
+        val snapshot = progressEstimator.update(
+            stage = stage,
+            stagePercent = stagePercent,
+            etaMs = etaMs,
+            metrics = metrics
+        )
 
+        onProgress(
+            snapshot.progress,
+            message,
+            snapshot.etaRemainingMs
+        )
+
+        Log.d(
+            TAG,
+            "DOWNLOAD_PROGRESS_SNAPSHOT " +
+                    "stage=${snapshot.stage} " +
+                    "progress=${snapshot.progress} " +
+                    "etaMs=${snapshot.etaRemainingMs} " +
+                    "waiting=${snapshot.waitingForNetwork}"
+        )
+    }
     try {
 
         val availableBytes = runCatching {
@@ -2368,13 +2439,11 @@ internal fun downloadSelectedVideo(
             "video"
         }
 
-        val videoProgressLimit = if (selectedFormat.hasAudio) {
-            78f
-        } else {
-            42f
-        }
-
-        onProgress(1f, "جاري تنزيل الفيديو...")
+        reportProgress(
+            stage = DownloadStage.VIDEO_DOWNLOAD,
+            stagePercent = 0f,
+            message = "جاري تنزيل الفيديو..."
+        )
 
         val videoStartedAt = SystemClock.elapsedRealtime()
         var videoFirstProgressAt = 0L
@@ -2386,19 +2455,28 @@ internal fun downloadSelectedVideo(
             directory = workDir,
             filePrefix = videoPrefix,
             formatSelector = selectedFormat.formatId
-        ) { progress ->
+        ) { progress, etaMs, metrics ->
 
             if (videoFirstProgressAt == 0L) {
                 videoFirstProgressAt = SystemClock.elapsedRealtime()
             }
 
-            onProgress(
-                progress * videoProgressLimit / 100f,
-                "تنزيل الفيديو: ${progress.toInt()}%"
+            reportProgress(
+                stage = DownloadStage.VIDEO_DOWNLOAD,
+                stagePercent = progress,
+                message = "تنزيل الفيديو: ${progress.toInt()}%",
+                etaMs = etaMs,
+                metrics = metrics
             )
         }
 
         videoDownloadSucceeded = true
+        reportProgress(
+            DownloadStage.VIDEO_DOWNLOAD,
+            100f,
+            "اكتمل تنزيل الفيديو.",
+            0L
+        )
         report.transfer(
             "VIDEO_DOWNLOAD",
             videoStartedAt,
@@ -2490,32 +2568,21 @@ internal fun downloadSelectedVideo(
                 }
             )
 
-            val audioStart = if (selectedFormat.hasAudio) {
-                78f
-            } else {
-                42f
-            }
-
-            val audioSpan = 82f - audioStart
+            reportProgress(
+                DownloadStage.AUDIO_DOWNLOAD,
+                0f,
+                "جاري تنزيل الصوت..."
+            )
 
             val audioErrors = mutableListOf<String>()
-            var highestAudioProgress = audioStart
 
             for ((index, candidate) in candidates.withIndex()) {
 
                 val attemptPrefix = "audio_${index + 1}"
 
-                val attemptStartProgress =
-                    audioStart +
-                            (index.toFloat() / candidates.size.toFloat()) * audioSpan
-
-                highestAudioProgress = maxOf(
-                    highestAudioProgress,
-                    attemptStartProgress
-                )
-
-                onProgress(
-                    highestAudioProgress.coerceIn(audioStart, 82f),
+                reportProgress(
+                    DownloadStage.AUDIO_DOWNLOAD,
+                    0f,
                     "جاري تجربة صيغة الصوت ${index + 1}/${candidates.size}..."
                 )
 
@@ -2531,28 +2598,18 @@ internal fun downloadSelectedVideo(
                         directory = workDir,
                         filePrefix = attemptPrefix,
                         formatSelector = candidate.formatId
-                    ) { progress ->
+                    ) { progress, etaMs, metrics ->
 
                         if (audioFirstProgressAt == 0L) {
                             audioFirstProgressAt = SystemClock.elapsedRealtime()
                         }
 
-                        val ratio =
-                            (index + progress / 100f) /
-                                    candidates.size.toFloat()
-
-                        val stageProgress =
-                            audioStart + ratio * audioSpan
-
-                        highestAudioProgress = maxOf(
-                            highestAudioProgress,
-                            stageProgress
-                        )
-
-                        onProgress(
-                            highestAudioProgress.coerceIn(audioStart, 82f),
-                            "تنزيل الصوت ${candidate.extension}: " +
-                                    "${progress.toInt()}%"
+                        reportProgress(
+                            stage = DownloadStage.AUDIO_DOWNLOAD,
+                            stagePercent = progress,
+                            message = "تنزيل الصوت ${candidate.extension}: ${progress.toInt()}%",
+                            etaMs = etaMs,
+                            metrics = metrics
                         )
                     }
 
@@ -2595,6 +2652,12 @@ internal fun downloadSelectedVideo(
 
                     audioFile = candidateFile
                     audioProbe = candidateProbe
+                    reportProgress(
+                        DownloadStage.AUDIO_DOWNLOAD,
+                        100f,
+                        "اكتمل تنزيل الصوت.",
+                        0L
+                    )
 
                     report.info(
                         "AUDIO_SOURCE",
@@ -2759,8 +2822,9 @@ internal fun downloadSelectedVideo(
             "frames=$totalVideoFrames"
         )
 
-        onProgress(
-            82f,
+        reportProgress(
+            DownloadStage.PROCESSING,
+            0f,
             "جاري تجهيز ملف MP4 النهائي..."
         )
 
@@ -2893,26 +2957,56 @@ internal fun downloadSelectedVideo(
 
                 { statistics ->
 
-                    val processedFrames = statistics
-                        .videoFrameNumber
-                        .coerceIn(0, totalVideoFrames)
+                    val durationMs = (
+                            (videoProbe.durationSeconds ?: 0.0) * 1000.0
+                            )
 
-                    val ratio =
-                        processedFrames.toFloat() /
+                    // statistics.time is already expressed in milliseconds.
+                    val processedMs = statistics.time
+                        .coerceAtLeast(0.0)
+
+                    val frameProgress = if (totalVideoFrames > 0) {
+                        statistics.videoFrameNumber.toFloat() /
                                 totalVideoFrames.toFloat()
+                    } else {
+                        0f
+                    }
 
-                    val progress = (82f + ratio * 11f)
-                        .coerceIn(82f, 93f)
+                    val processingProgress = if (
+                        durationMs > 0.0 &&
+                        processedMs >= 0.0 &&
+                        processedMs <= durationMs * 1.02
+                    ) {
+                        (processedMs / durationMs * 100.0)
+                            .toFloat()
+                            .coerceIn(0f, 100f)
+                    } else {
+                        frameProgress * 100f
+                    }
 
-                    onProgress(
-                        progress,
-                        "جاري معالجة الفيديو: ${progress.toInt()}%"
+                    val speed = statistics.speed
+                        .takeIf { it.isFinite() && it > 0.0 }
+
+                    val processingEtaMs = speed?.let {
+                        (
+                                (durationMs - processedMs)
+                                    .coerceAtLeast(0.0) / it
+                                ).roundToLong()
+                    }
+
+                    reportProgress(
+                        stage = DownloadStage.PROCESSING,
+                        stagePercent = processingProgress,
+                        message = "جاري معالجة الفيديو...",
+                        etaMs = processingEtaMs
                     )
 
                     Log.d(
                         TAG,
                         "FFMPEG_PROGRESS: " +
-                                "$processedFrames / $totalVideoFrames"
+                                "frames=${statistics.videoFrameNumber}/$totalVideoFrames " +
+                                "timeMs=$processedMs durationMs=$durationMs " +
+                                "speed=$speed etaMs=$processingEtaMs"
                     )
                 }
             )
@@ -3018,15 +3112,6 @@ internal fun downloadSelectedVideo(
             totalVideoFrames,
             mergedFile.length()
         )
-        if (!copyVideo) {
-            DownloadRoutePlanner.recordVideoEncodeSample(
-                context = context,
-                sourceCodec = videoProbe.videoCodec,
-                height = videoProbe.videoHeight,
-                durationSeconds = videoProbe.durationSeconds,
-                elapsedMs = SystemClock.elapsedRealtime() - ffmpegStartedAt
-            )
-        }
 
         val ffmpegSession = completedFfmpegSession
             ?: throw IOException(
@@ -3052,11 +3137,25 @@ internal fun downloadSelectedVideo(
                 "فشل تحويل الفيديو: $details"
             )
         }
-
+        DownloadRoutePlanner.recordProcessingSample(
+            context = context,
+            sourceVideoCodec = videoProbe.videoCodec,
+            height = videoProbe.videoHeight,
+            sourceAudioCodec = finalAudioProbe.audioCodec,
+            videoNeedsEncode = !copyVideo,
+            audioNeedsEncode = !copyAudio,
+            durationSeconds = videoProbe.durationSeconds,
+            elapsedMs = SystemClock.elapsedRealtime() - ffmpegStartedAt,
+            encoderMode = if (!copyVideo) "openh264" else "aac"
+        )
         // -------------------------------------------------
         // 9. التحقق من مواصفات المِلف النهائي
         // -------------------------------------------------
-
+        reportProgress(
+            DownloadStage.VALIDATING,
+            0f,
+            "جاري التحقق من سلامة الفيديو..."
+        )
         val finalProbeStartedAt = SystemClock.elapsedRealtime()
 
         val outputProbe = logMediaProbe(
@@ -3142,10 +3241,17 @@ internal fun downloadSelectedVideo(
             TAG,
             "FINAL_OUTPUT_VALIDATION=SUCCESS"
         )
+        reportProgress(
+            DownloadStage.VALIDATING,
+            100f,
+            "اكتمل التحقق من الفيديو.",
+            0L
+        )
 
-        onProgress(
-            94f,
-            "اكتمل التحويل والتحقق من سلامة الفيديو..."
+        reportProgress(
+            DownloadStage.SAVING,
+            0f,
+            "جاري حفظ الفيديو..."
         )
 
         // -------------------------------------------------
@@ -3160,12 +3266,18 @@ internal fun downloadSelectedVideo(
             title
         ) { copyProgress ->
 
-            val progress =
-                94f + (copyProgress / 100f) * 6f
+            val saveEtaMs = selectedFormat.estimatedSaveMs?.let {
+                (
+                        it.toDouble() *
+                                (100f - copyProgress) / 100.0
+                        ).roundToLong()
+            }
 
-            onProgress(
-                progress,
-                "جاري حفظ الفيديو: ${copyProgress.toInt()}%"
+            reportProgress(
+                stage = DownloadStage.SAVING,
+                stagePercent = copyProgress,
+                message = "جاري حفظ الفيديو: ${copyProgress.toInt()}%",
+                etaMs = saveEtaMs
             )
         }
 
@@ -3181,9 +3293,12 @@ internal fun downloadSelectedVideo(
             elapsedMs = SystemClock.elapsedRealtime() - saveStartedAt
         )
 
+        progressEstimator.finish()
+
         onProgress(
             100f,
-            "تم الحفظ بنجاح."
+            "تم الحفظ بنجاح.",
+            0L
         )
 
         return savedUri
@@ -3229,13 +3344,16 @@ private fun DownloadQueueTaskCard(
     auroraTrack: Color,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
+    liveProgress: Float? = null,
+    etaRemainingMs: Long? = null,
     isDragging: Boolean = false,
     dragHandleModifier: Modifier? = null
 ) {
     val active = task.status == DownloadTaskUiState.STATUS_QUEUED ||
             task.status == DownloadTaskUiState.STATUS_RUNNING ||
             task.status == DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK
-
+    val currentProgress = (liveProgress ?: task.progress)
+        .coerceIn(0f, 100f)
     val statusLabel = when (task.status) {
         DownloadTaskUiState.STATUS_QUEUED -> "في الانتظار"
         DownloadTaskUiState.STATUS_RUNNING -> "جاري التنزيل"
@@ -3301,7 +3419,7 @@ private fun DownloadQueueTaskCard(
             )
 
             Text(
-                text = "${task.progress.toInt().coerceIn(0, 100)}%",
+                text = "${currentProgress.toInt()}%",
                 color = auroraAccentSoft,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Bold
@@ -3309,14 +3427,31 @@ private fun DownloadQueueTaskCard(
         }
 
         FilmstripProgressBar(
-            progress = (task.progress / 100f).coerceIn(0f, 1f),
+            progress = (currentProgress / 100f).coerceIn(0f, 1f),
             active = task.status == DownloadTaskUiState.STATUS_RUNNING,
             accent = auroraAccent,
             accentSoft = auroraAccentSoft,
             track = auroraTrack,
             modifier = Modifier.fillMaxWidth()
         )
+        if (active) {
+            val etaText = when (task.status) {
+                DownloadTaskUiState.STATUS_QUEUED ->
+                    "في انتظار بدء التنزيل"
 
+                DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK ->
+                    "التقدير متوقف حتى عودة الاتصال"
+
+                else ->
+                    "الوقت المتبقي: ${formatRemainingTime(etaRemainingMs)}"
+            }
+
+            Text(
+                text = etaText,
+                color = auroraMuted,
+                fontSize = 11.sp
+            )
+        }
         if (active) {
             Button(
                 onClick = onCancel,
@@ -3342,6 +3477,12 @@ fun DownloaderScreen(engineReady: Boolean, context: Context) {
     val queueTasks by queueRepository.tasks.collectAsState(
         initial = emptyList()
     )
+
+    val liveDownloadTasks by DownloadUiStateStore.tasks.collectAsState()
+
+    val liveDownloadTasksById = remember(liveDownloadTasks) {
+        liveDownloadTasks.associateBy { it.id }
+    }
 
     val screenScope = rememberCoroutineScope()
 
@@ -4427,6 +4568,8 @@ fun DownloaderScreen(engineReady: Boolean, context: Context) {
                                 fixedQueueTasks.forEach { task ->
                                     DownloadQueueTaskCard(
                                         task = task,
+                                        liveProgress = liveDownloadTasksById[task.id]?.progress,
+                                        etaRemainingMs = liveDownloadTasksById[task.id]?.etaRemainingMs,
                                         auroraText = auroraText,
                                         auroraMuted = auroraMuted,
                                         auroraAccent = auroraAccent,
@@ -4560,6 +4703,8 @@ fun DownloaderScreen(engineReady: Boolean, context: Context) {
 
                                                 DownloadQueueTaskCard(
                                                     task = task,
+                                                    liveProgress = liveDownloadTasksById[task.id]?.progress,
+                                                    etaRemainingMs = liveDownloadTasksById[task.id]?.etaRemainingMs,
                                                     auroraText = auroraText,
                                                     auroraMuted = auroraMuted,
                                                     auroraAccent = auroraAccent,
@@ -4813,6 +4958,16 @@ private fun FilmstripProgressBar(
 ) {
     val phase = remember { Animatable(0f) }
     val safeProgress = progress.coerceIn(0f, 1f)
+
+    val animatedProgress by animateFloatAsState(
+        targetValue = progress.coerceIn(0f, 1f),
+        animationSpec = tween(
+            durationMillis = 450,
+            easing = LinearEasing
+        ),
+        label = "downloadProgress"
+    )
+
     val isComplete = safeProgress >= 0.999f
 
     LaunchedEffect(active, isComplete) {
@@ -4838,7 +4993,7 @@ private fun FilmstripProgressBar(
         val width = size.width
         val height = size.height
         val radius = height / 2f
-        val fillWidth = width * safeProgress
+        val fillWidth = width * animatedProgress
         val fillLeft = width - fillWidth
 
         // Full track.
@@ -5136,4 +5291,3 @@ private fun AnalysisAnimation(
         )
     }
 }
-

@@ -55,4 +55,15 @@
         android:progressTint="#3988E8"
         android:progressBackgroundTint="#DCE3EC" />
 
+    <TextView
+        android:id="@+id/notification_eta"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:text="جارٍ حساب الوقت المتبقي"
+        android:textColor="#62666D"
+        android:textSize="11sp"
+        android:maxLines="1"
+        android:ellipsize="end" />
+
 </LinearLayout>

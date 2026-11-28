@@ -28,12 +28,12 @@ class DownloadQueueRepository private constructor(context: Context) {
 
         require(
             (uri.scheme == "https" || uri.scheme == "http") &&
-                !uri.host.isNullOrBlank()
+                    !uri.host.isNullOrBlank()
         ) {
             "A valid HTTP or HTTPS URL is required."
         }
 
-        require(selectedFormat.isAvailable) {
+        require(selectedFormat.formatId.isNotBlank()) {
             "The selected video format is not available."
         }
 
@@ -71,21 +71,22 @@ class DownloadQueueRepository private constructor(context: Context) {
 
     suspend fun getActiveTasks(): List<DownloadQueueEntity> =
         dao.getActiveTasks()
+
     suspend fun getTask(taskId: String): DownloadQueueEntity? =
         dao.getById(taskId)
 
     suspend fun getNextQueued(): DownloadQueueEntity? =
         dao.getNextPending()
+
     suspend fun reorderQueuedTasks(
         orderedTaskIds: List<String>
     ): Boolean {
         return dao.reorderQueuedTasks(orderedTaskIds)
     }
+
     suspend fun claimNextQueued(): DownloadQueueEntity? =
         dao.claimNextQueued()
 
-    suspend fun getPendingCount(): Int =
-        dao.getPendingCount()
     suspend fun deleteTask(taskId: String) {
         dao.deleteById(taskId)
     }
@@ -96,6 +97,7 @@ class DownloadQueueRepository private constructor(context: Context) {
     /** Keeps only the newest terminal records; active queue rows are never selected. */
     suspend fun pruneTerminalHistory(keepNewest: Int = 100): Int =
         dao.pruneTerminalHistory(keepNewest.coerceAtLeast(0))
+
     suspend fun updateTaskState(
         taskId: String,
         status: String,
@@ -150,6 +152,13 @@ internal object DownloadQueueFormatCodec {
             put("videoBitrateKbps", format.videoBitrateKbps ?: JSONObject.NULL)
             put("plannedAudioFormatId", format.plannedAudioFormatId ?: JSONObject.NULL)
             put("estimatedTotalMs", format.estimatedTotalMs ?: JSONObject.NULL)
+            put("mediaDurationSeconds", format.mediaDurationSeconds ?: JSONObject.NULL)
+            put("estimatedVideoDownloadMs", format.estimatedVideoDownloadMs ?: JSONObject.NULL)
+            put("estimatedAudioDownloadMs", format.estimatedAudioDownloadMs ?: JSONObject.NULL)
+            put("estimatedProcessingMs", format.estimatedProcessingMs ?: JSONObject.NULL)
+            put("estimatedValidationMs", format.estimatedValidationMs ?: JSONObject.NULL)
+            put("estimatedSaveMs", format.estimatedSaveMs ?: JSONObject.NULL)
+            put("estimatedRetryRiskMs", format.estimatedRetryRiskMs ?: JSONObject.NULL)
         }.toString()
 
     fun decodeVideo(json: String): VideoFormat {
@@ -173,7 +182,14 @@ internal object DownloadQueueFormatCodec {
             audioDownloadSizeBytes = nullableLong(item, "audioDownloadSizeBytes"),
             videoBitrateKbps = nullableDouble(item, "videoBitrateKbps"),
             plannedAudioFormatId = nullableString(item, "plannedAudioFormatId"),
-            estimatedTotalMs = nullableLong(item, "estimatedTotalMs")
+            estimatedTotalMs = nullableLong(item, "estimatedTotalMs"),
+            mediaDurationSeconds = nullableDouble(item, "mediaDurationSeconds"),
+            estimatedVideoDownloadMs = nullableLong(item, "estimatedVideoDownloadMs"),
+            estimatedAudioDownloadMs = nullableLong(item, "estimatedAudioDownloadMs"),
+            estimatedProcessingMs = nullableLong(item, "estimatedProcessingMs"),
+            estimatedValidationMs = nullableLong(item, "estimatedValidationMs"),
+            estimatedSaveMs = nullableLong(item, "estimatedSaveMs"),
+            estimatedRetryRiskMs = nullableLong(item, "estimatedRetryRiskMs")
         )
     }
 
@@ -215,7 +231,7 @@ internal object DownloadQueueFormatCodec {
                 sizeIsEstimate = item.optBoolean("sizeIsEstimate", true),
                 language = nullableString(item, "language"),
                 formatNote = nullableString(item, "formatNote"),
-                languagePreference = nullableInt(item, "languagePreference"),
+                languagePreference = nullableLanguagePreference(item),
                 protocol = nullableString(item, "protocol")
             )
         }
@@ -227,8 +243,12 @@ internal object DownloadQueueFormatCodec {
     private fun nullableLong(json: JSONObject, key: String): Long? =
         if (!json.has(key) || json.isNull(key)) null else json.getLong(key)
 
-    private fun nullableInt(json: JSONObject, key: String): Int? =
-        if (!json.has(key) || json.isNull(key)) null else json.getInt(key)
+    private fun nullableLanguagePreference(json: JSONObject): Int? =
+        if (!json.has("languagePreference") || json.isNull("languagePreference")) {
+            null
+        } else {
+            json.getInt("languagePreference")
+        }
 
     private fun nullableDouble(json: JSONObject, key: String): Double? =
         if (!json.has(key) || json.isNull(key)) null else json.getDouble(key)

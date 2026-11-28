@@ -25,12 +25,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
@@ -41,11 +41,13 @@ import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
+import kotlin.time.Duration.Companion.milliseconds
 
 internal data class DownloadTaskUiState(
     val id: String,
     val title: String,
     val progress: Float = 0f,
+    val etaRemainingMs: Long? = null,
     val status: String = STATUS_QUEUED,
     val message: String = "في قائمة الانتظار",
     val savedUri: String? = null,
@@ -94,6 +96,7 @@ internal object DownloadUiStateStore {
     fun updateTask(
         id: String,
         progress: Float? = null,
+        etaRemainingMs: Long? = null,
         status: String? = null,
         message: String? = null
     ) {
@@ -101,6 +104,9 @@ internal object DownloadUiStateStore {
             if (task.id != id) task else task.copy(
                 progress = progress?.takeIf { it.isFinite() }?.coerceIn(0f, 100f)
                     ?: task.progress,
+                etaRemainingMs = etaRemainingMs
+                    ?: if (status == DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK) null
+                    else task.etaRemainingMs,
                 status = status ?: task.status,
                 message = message ?: task.message,
                 updatedAt = System.currentTimeMillis()
@@ -124,6 +130,7 @@ internal object DownloadUiStateStore {
                 status = status,
                 message = message,
                 savedUri = savedUri,
+                etaRemainingMs = null,
                 updatedAt = System.currentTimeMillis()
             )
         }
@@ -135,18 +142,6 @@ internal object DownloadUiStateStore {
             finishedAt = System.currentTimeMillis()
         )
         publishAggregate()
-    }
-
-    /** Backward-compatible helpers used by the existing single-download UI. */
-    fun begin() {
-        state.value = DownloadUiState(isRunning = true, progress = 0f)
-    }
-
-    fun updateProgress(progress: Float) {
-        val current = state.value
-        if (current.isRunning) {
-            state.value = current.copy(progress = progress.coerceIn(0f, 100f))
-        }
     }
 
     fun finish(message: String, savedUri: String? = null) {
@@ -218,6 +213,9 @@ class DownloadForegroundService : Service() {
         @Volatile var workerThread: Thread? = null
         @Volatile var future: Future<*>? = null
         @Volatile var progress: Float = 0f
+        @Volatile var etaRemainingMs: Long? = null
+        @Volatile var progressEstimator: DownloadProgressEstimator? = null
+        @Volatile var lastNotifiedEtaBucket: Long = Long.MIN_VALUE
         @Volatile var status: String = DownloadTaskUiState.STATUS_QUEUED
         @Volatile var message: String = "في قائمة الانتظار"
         @Volatile var lastNotifiedPercent: Int = -1
@@ -232,8 +230,6 @@ class DownloadForegroundService : Service() {
     private val serviceExecutor: ExecutorService = Executors.newFixedThreadPool(MAX_CONCURRENT_DOWNLOADS)
     private val activeTasks = ConcurrentHashMap<String, ActiveTask>()
     private val processingTaskIds = ConcurrentHashMap.newKeySet<String>()
-    private val allocatedNotificationIds = ConcurrentHashMap.newKeySet<Int>()
-    private val nextNotificationId = AtomicInteger(TASK_NOTIFICATION_ID_BASE)
     private val mainHandler by lazy { android.os.Handler(mainLooper) }
 
     @Volatile private var foregroundStarted = false
@@ -265,6 +261,33 @@ class DownloadForegroundService : Service() {
         queueRepository = DownloadQueueRepository.getInstance(applicationContext)
         createNotificationChannel()
         registerNetworkMonitor()
+
+        serviceScope.launch {
+            while (isActive) {
+                delay(500.milliseconds)
+
+                activeTasks.values.toList().forEach { task ->
+                    if (
+                        task.status != DownloadTaskUiState.STATUS_RUNNING &&
+                        task.status != DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK
+                    ) {
+                        return@forEach
+                    }
+
+                    val estimator = task.progressEstimator ?: return@forEach
+                    val snapshot = estimator.snapshot()
+
+                    task.progress = maxOf(task.progress, snapshot.progress)
+                    task.etaRemainingMs = snapshot.etaRemainingMs
+
+                    setTaskState(
+                        task = task,
+                        status = task.status,
+                        message = task.message
+                    )
+                }
+            }
+        }
 
         serviceScope.launch {
             try {
@@ -696,24 +719,46 @@ class DownloadForegroundService : Service() {
                 if (networkAvailable) "جاري بدء التنزيل..." else "الاتصال بالإنترنت غير متاح؛ في انتظار عودته."
             )
 
+            val sharedEstimator = DownloadProgressEstimator(
+                task.request.selectedFormat
+            )
+            task.progressEstimator = sharedEstimator
+            task.etaRemainingMs = sharedEstimator.snapshot().etaRemainingMs
+
+            if (!networkAvailable) {
+                sharedEstimator.setWaitingForNetwork(true)
+                task.etaRemainingMs = null
+            }
+
             val savedUri = downloadSelectedVideo(
                 context = applicationContext,
                 url = task.request.url,
                 title = task.request.title,
                 selectedFormat = task.request.selectedFormat,
-                audioFormats = task.request.audioFormats
-            ) { progress, message ->
+                audioFormats = task.request.audioFormats,
+                progressEstimator = sharedEstimator
+            ) { progress, message, etaRemainingMs ->
                 if (task.cancellationRequested.get() || Thread.currentThread().isInterrupted) {
                     throw IOException("تم إيقاف التنزيل.")
                 }
 
-                task.progress = if (progress.isFinite()) progress.coerceIn(0f, 100f) else task.progress
+                val safeProgress = if (progress.isFinite()) {
+                    progress.coerceIn(0f, 100f)
+                } else {
+                    task.progress
+                }
+
+                task.progress = maxOf(task.progress, safeProgress)
+                task.etaRemainingMs = etaRemainingMs
                 task.message = message
+
                 val status = when {
                     !networkAvailable && isNetworkTransferStage(message) ->
                         DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK
-                    else -> DownloadTaskUiState.STATUS_RUNNING
+                    else ->
+                        DownloadTaskUiState.STATUS_RUNNING
                 }
+
                 setTaskState(task, status, message)
                 updateForegroundStage(task, message)
             }
@@ -761,6 +806,7 @@ class DownloadForegroundService : Service() {
         DownloadUiStateStore.updateTask(
             id = task.request.taskId,
             progress = task.progress,
+            etaRemainingMs = task.etaRemainingMs,
             status = status,
             message = message
         )
@@ -770,9 +816,10 @@ class DownloadForegroundService : Service() {
         // from yt-dlp/FFmpeg to SQLite.
         val now = System.currentTimeMillis()
         val percent = task.progress.roundToInt().coerceIn(0, 100)
+        val elapsedSincePersist = now - task.lastPersistedAt
         val shouldPersist = status != task.lastPersistedStatus ||
-            percent != task.lastPersistedPercent ||
-            now - task.lastPersistedAt >= 1_500L
+                (percent != task.lastPersistedPercent && elapsedSincePersist >= 1_000L) ||
+                elapsedSincePersist >= 2_500L
         if (shouldPersist && !serviceShuttingDown) {
             task.lastPersistedStatus = status
             task.lastPersistedPercent = percent
@@ -813,6 +860,7 @@ class DownloadForegroundService : Service() {
 
                 task.status = finalStatus
                 task.message = finalMessage
+                task.etaRemainingMs = null
 
                 if (finalStatus == DownloadTaskUiState.STATUS_SUCCEEDED) {
                     task.progress = 100f
@@ -1119,12 +1167,16 @@ class DownloadForegroundService : Service() {
         activeTasks.values.forEach { task ->
             if (task.status == DownloadTaskUiState.STATUS_QUEUED) return@forEach
             if (available && task.status == DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK) {
+                task.progressEstimator?.setWaitingForNetwork(false)
+                task.etaRemainingMs = task.progressEstimator?.snapshot()?.etaRemainingMs
                 setTaskState(task, DownloadTaskUiState.STATUS_RUNNING, "عاد الاتصال بالإنترنت؛ جارٍ استكمال التنزيل.")
             } else if (
                 !available &&
                 task.status == DownloadTaskUiState.STATUS_RUNNING &&
                 isNetworkTransferStage(task.message)
             ) {
+                task.progressEstimator?.setWaitingForNetwork(true)
+                task.etaRemainingMs = null
                 setTaskState(task, DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK, "انقطع الإنترنت؛ يحتفظ yt-dlp بالتقدم ويحاول الاستكمال تلقائيًا.")
             }
         }
@@ -1231,6 +1283,23 @@ class DownloadForegroundService : Service() {
                 .coerceIn(0, 100)
         }
 
+        val etaTask = tasks.firstOrNull {
+            it.status == DownloadTaskUiState.STATUS_RUNNING
+        } ?: tasks.firstOrNull {
+            it.status == DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK
+        }
+
+        val etaText = when {
+            etaTask?.status == DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK ->
+                "الوقت المتبقي: بعد عودة الاتصال"
+            etaTask?.etaRemainingMs != null ->
+                "المتبقي: ${formatRemainingTime(etaTask.etaRemainingMs)}"
+            etaTask != null ->
+                "جارٍ حساب الوقت المتبقي"
+            else ->
+                ""
+        }
+
         val summary = when {
             waitingCount > 0 && runningCount > 0 ->
                 "جاري التنزيل • بعض المهام تنتظر الإنترنت"
@@ -1268,6 +1337,11 @@ class DownloadForegroundService : Service() {
                 setTextViewText(
                     R.id.notification_percent,
                     "$averageProgress%"
+                )
+
+                setTextViewText(
+                    R.id.notification_eta,
+                    etaText
                 )
 
                 setProgressBar(
@@ -1372,6 +1446,20 @@ class DownloadForegroundService : Service() {
                 setTextViewText(
                     R.id.notification_percent,
                     "$percent%"
+                )
+
+                setTextViewText(
+                    R.id.notification_eta,
+                    when {
+                        task.status == DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK ->
+                            "الوقت المتبقي: بعد عودة الاتصال"
+                        task.etaRemainingMs != null ->
+                            "المتبقي: ${formatRemainingTime(task.etaRemainingMs)}"
+                        ongoing ->
+                            "جارٍ حساب الوقت المتبقي"
+                        else ->
+                            ""
+                    }
                 )
 
                 setProgressBar(
@@ -1502,15 +1590,21 @@ class DownloadForegroundService : Service() {
 
             val percent = task.progress.roundToInt().coerceIn(0, 100)
 
+            val etaBucket = task.etaRemainingMs
+                ?.div(5_000L)
+                ?: -1L
+
             val changed = percent != task.lastNotifiedPercent ||
                     task.status != task.lastNotifiedStatus ||
-                    task.message != task.lastNotifiedMessage
+                    task.message != task.lastNotifiedMessage ||
+                    etaBucket != task.lastNotifiedEtaBucket
 
             if (!changed) return
 
             task.lastNotifiedPercent = percent
             task.lastNotifiedStatus = task.status
             task.lastNotifiedMessage = task.message
+            task.lastNotifiedEtaBucket = etaBucket
 
             if (task.status != DownloadTaskUiState.STATUS_CANCELLED) {
                 notificationManager.notify(
@@ -1526,20 +1620,6 @@ class DownloadForegroundService : Service() {
     private fun updateSummaryNotification() {
         if (foregroundStarted) {
             notificationManager.notify(FOREGROUND_NOTIFICATION_ID, buildSummaryNotification())
-        }
-    }
-
-    /** Allocate collision-free notification IDs for all tasks in this service instance. */
-    private fun allocateNotificationId(): Int {
-        while (true) {
-            val candidate = nextNotificationId.getAndUpdate { current ->
-                if (current >= TASK_NOTIFICATION_ID_BASE + TASK_NOTIFICATION_ID_RANGE - 1) {
-                    TASK_NOTIFICATION_ID_BASE
-                } else {
-                    current + 1
-                }
-            }
-            if (allocatedNotificationIds.add(candidate)) return candidate
         }
     }
 
@@ -1577,7 +1657,7 @@ class DownloadForegroundService : Service() {
     private fun releaseWakeLockIfIdle() {
         val hasExecutingTask = activeTasks.values.any {
             it.status == DownloadTaskUiState.STATUS_RUNNING ||
-                it.status == DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK
+                    it.status == DownloadTaskUiState.STATUS_WAITING_FOR_NETWORK
         }
         if (!hasExecutingTask) releaseWakeLock()
     }
@@ -1633,36 +1713,11 @@ class DownloadForegroundService : Service() {
             throw IOException("بيانات طلب التنزيل غير مكتملة.")
         }
 
-        val video = JSONObject(videoJson)
-        val selectedFormat = VideoFormat(
-            formatId = video.getString("formatId"),
-            height = video.getInt("height"),
-            extension = video.getString("extension"),
-            fileSize = nullableFileSize(video),
-            sizeIsEstimate = video.getBoolean("sizeIsEstimate"),
-            hasAudio = video.getBoolean("hasAudio"),
-            fps = nullableFps(video),
-            qualityTier = QualityTier.valueOf(video.getString("qualityTier")),
-            videoCodec = nullableString(video, "videoCodec"),
-            audioCodec = nullableString(video, "audioCodec"),
-            protocol = nullableString(video, "protocol")
-        )
+        val selectedFormat =
+            DownloadQueueFormatCodec.decodeVideo(videoJson)
 
-        val audioArray = JSONArray(audioJson)
-        val audioFormats = (0 until audioArray.length()).map { index ->
-            val item = audioArray.getJSONObject(index)
-            AudioFormat(
-                formatId = item.getString("formatId"),
-                bitrate = item.optDouble("bitrate", 0.0),
-                extension = item.optString("extension", "unknown"),
-                fileSize = nullableFileSize(item),
-                codec = nullableString(item, "codec"),
-                sizeIsEstimate = item.optBoolean("sizeIsEstimate", true),
-                language = nullableString(item, "language"),
-                formatNote = nullableString(item, "formatNote"),
-                languagePreference = nullableLanguagePreference(item)
-            )
-        }
+        val audioFormats =
+            DownloadQueueFormatCodec.decodeAudio(audioJson)
 
         return DownloadRequest(
             taskId = taskId,
@@ -1690,26 +1745,6 @@ class DownloadForegroundService : Service() {
         }
     }
 
-    private fun nullableString(json: JSONObject, key: String): String? {
-        if (json.isNull(key)) return null
-        return json.optString(key).takeIf { it.isNotBlank() && it != "null" }
-    }
-
-    private fun nullableFileSize(json: JSONObject): Long? {
-        if (json.isNull("fileSize")) return null
-        return json.optLong("fileSize").takeIf { it > 0L }
-    }
-
-    private fun nullableLanguagePreference(json: JSONObject): Int? {
-        if (json.isNull("languagePreference")) return null
-        return json.optInt("languagePreference")
-    }
-
-    private fun nullableFps(json: JSONObject): Double? {
-        if (json.isNull("fps")) return null
-        return json.optDouble("fps").takeIf { it.isFinite() && it > 0.0 }
-    }
-
     companion object {
         private const val TAG = "VideoDownloader"
         private const val CHANNEL_ID = "video_download_progress"
@@ -1718,8 +1753,6 @@ class DownloadForegroundService : Service() {
         private const val ERROR_NOTIFICATION_ID = 7304
         private const val CONTENT_REQUEST_CODE = 7302
         private const val CANCEL_ALL_REQUEST_CODE = 7305
-        private const val TASK_NOTIFICATION_ID_BASE = 10_000
-        private const val TASK_NOTIFICATION_ID_RANGE = 900_000
         private const val MAX_CONCURRENT_DOWNLOADS = 1
         private const val MAX_WAKE_LOCK_MS = 6L * 60L * 60L * 1000L
 
@@ -1762,42 +1795,18 @@ class DownloadForegroundService : Service() {
             taskId: String = UUID.randomUUID().toString(),
             openOnFinish: Boolean = true
         ): Intent {
-            val videoJson = JSONObject().apply {
-                put("formatId", selectedFormat.formatId)
-                put("height", selectedFormat.height)
-                put("extension", selectedFormat.extension)
-                put("fileSize", selectedFormat.fileSize ?: JSONObject.NULL)
-                put("sizeIsEstimate", selectedFormat.sizeIsEstimate)
-                put("hasAudio", selectedFormat.hasAudio)
-                put("fps", selectedFormat.fps ?: JSONObject.NULL)
-                put("qualityTier", selectedFormat.qualityTier.name)
-                put("videoCodec", selectedFormat.videoCodec ?: JSONObject.NULL)
-                put("audioCodec", selectedFormat.audioCodec ?: JSONObject.NULL)
-                put("protocol", selectedFormat.protocol ?: JSONObject.NULL)
-            }
+            val videoJson =
+                DownloadQueueFormatCodec.encodeVideo(selectedFormat)
 
-            val audioJson = JSONArray().apply {
-                audioFormats.forEach { audio ->
-                    put(JSONObject().apply {
-                        put("formatId", audio.formatId)
-                        put("bitrate", audio.bitrate)
-                        put("extension", audio.extension)
-                        put("fileSize", audio.fileSize ?: JSONObject.NULL)
-                        put("codec", audio.codec ?: JSONObject.NULL)
-                        put("sizeIsEstimate", audio.sizeIsEstimate)
-                        put("language", audio.language ?: JSONObject.NULL)
-                        put("formatNote", audio.formatNote ?: JSONObject.NULL)
-                        put("languagePreference", audio.languagePreference ?: JSONObject.NULL)
-                    })
-                }
-            }
+            val audioJson =
+                DownloadQueueFormatCodec.encodeAudio(audioFormats)
 
             return Intent(context, DownloadForegroundService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_URL, url)
                 putExtra(EXTRA_TITLE, title)
-                putExtra(EXTRA_VIDEO_JSON, videoJson.toString())
-                putExtra(EXTRA_AUDIO_JSON, audioJson.toString())
+                putExtra(EXTRA_VIDEO_JSON, videoJson)
+                putExtra(EXTRA_AUDIO_JSON, audioJson)
                 putExtra(EXTRA_TASK_ID, taskId)
                 putExtra(EXTRA_OPEN_ON_FINISH, openOnFinish)
             }
